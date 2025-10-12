@@ -1,3 +1,24 @@
+import torch
+import torch.nn as nn
+from torch.func import jacrev, vmap, functional_call
+from einops import rearrange
+
+# per-point function to batch jacobian later
+def make_f_single(model, proj=slice(None)):
+    def f(params, h, x, kw):
+        x1, h1 = rearrange(x, '... -> 1 ...'), rearrange(h, '... -> 1 ...')
+        *_, h_next_b = functional_call(model, params, (x1, h1), kw)
+        return rearrange(h_next_b, '1 h -> h')[proj] # remove fake batch, slice
+    return f
+
+def add_grad_(p, g):
+    if g is None: return
+    g = g.detach()
+    if p.grad is None:
+        p.grad = g.clone()
+    else:
+        p.grad.add_(g)
+
 class RTRL:
     @torch.no_grad()
     def __init__(self, state_parameters, B, H):
