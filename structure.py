@@ -33,7 +33,7 @@ class CircularTree:
         r = (self.head + r) % self.n
         return self._query_phys(l, r) if r > l else self.op(self._query_phys(0, r), self._query_phys(l, self.n))
 
-# Binary operation: sparse LEFT-multiply (note: B @ A)
+# Binary operation: sparse LEFT-multiply B @ A
 def sparse_left_mul(a, b):
     if a is None: return b
     elif b is None: return a
