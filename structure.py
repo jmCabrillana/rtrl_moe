@@ -36,17 +36,29 @@ class CircularTree:
 # Binary operation: sparse LEFT-multiply (note: B @ A)
 def sparse_left_mul(a, b):
     if a is None: return b
-    elif b is None: return a 
+    elif b is None: return a
     else:
-        (idx_a, A), (idx_b, B), d = a, b, a[1].shape[-1]
-        print('A', idx_a, A.shape, 'B', idx_b, B.shape)
+        (idx_a, A), (idx_b, B) = a, b
+        d = a[1].shape[-1]
         idx_union = list(sorted(set(idx_a) | set(idx_b)))
         pos_a, pos_b = {i: p for p, i in enumerate(idx_a)}, {i: p for p, i in enumerate(idx_b)}
         A_delta = A.clone()
-        A_delta[torch.arange(len(idx_a), device=A.device), idx_a] -= 1
-        Cb = B + B[:, idx_a] @ A_delta
-        rows = torch.stack([Cb[pos_b[i]] if i in pos_b else A[pos_a[i]] for i in idx_union], dim=0)
+        A_delta[:, torch.arange(len(idx_a), device=A.device), idx_a] -= 1
+        Cb = B + B[:, :, idx_a] @ A_delta
+        rows = torch.stack([Cb[:, pos_b[i]] if i in pos_b else A[:, pos_a[i]] for i in idx_union], dim=1)
         return (idx_union, rows)
+# def sparse_left_mul(a, b): # 1D
+#     if a is None: return b
+#     elif b is None: return a 
+#     else:
+#         (idx_a, A), (idx_b, B), d = a, b, a[1].shape[-1]
+#         idx_union = list(sorted(set(idx_a) | set(idx_b)))
+#         pos_a, pos_b = {i: p for p, i in enumerate(idx_a)}, {i: p for p, i in enumerate(idx_b)}
+#         A_delta = A.clone()
+#         A_delta[torch.arange(len(idx_a), device=A.device), idx_a] -= 1
+#         Cb = B + B[:, idx_a] @ A_delta
+#         rows = torch.stack([Cb[pos_b[i]] if i in pos_b else A[pos_a[i]] for i in idx_union], dim=0)
+#         return (idx_union, rows)
 
 def materialize(sparse, n, dtype=torch.int64):
     I = torch.eye(n, dtype=dtype)
