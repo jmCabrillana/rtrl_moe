@@ -1,0 +1,6 @@
+matplotlib
+torch
+torchvision
+torchaudio
+tensorboard
+einops
