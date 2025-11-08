@@ -24,3 +24,19 @@
 #     h = h_new.detach().requires_grad_()
 #     writer.add_scalar("train/loss", loss.item(), epoch*SEQ_LEN+start+t)
 #     if t%10==0: print(f"loss: {running:.4f}")
+
+
+        # mixed = torch.zeros(B, S, D, device=latent.device, dtype=latent.dtype)
+        # for i in range(self.state_gate.k):
+        #     for e in range(len(self.state_experts)):
+        #         mask = (idx[:, i] == e)                   # [B]
+        #         if mask.any():
+        #             acc = torch.einsum('b, b S D-> b S D', w[mask, i], self.state_experts[e](latent[mask]))
+        #             mixed = mixed.index_put((mask,), acc, accumulate=True)
+
+        # for i in range(2):
+        #     for s in range(S):
+        #         mask = (tgt_idx[:, i] == s)
+        #         acc = torch.einsum('b, b D-> b D', w[mask, i], latent[mask, s])
+        #         latent = latent.index_put((mask, torch.tensor(s, device=device)),
+        #                                 acc, accumulate=True)
