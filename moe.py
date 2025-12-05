@@ -137,11 +137,11 @@ class RecurrentMoE(nn.Module):
         latent = latent + attn_out
         latent = latent + self.state_ffn(self.state_ln_ffn(latent))
 
-        # (2) MoE with top-k experts (sequence-level) =1 here
-        # pooled = self.state_ln_moe_in(latent.mean(dim=1))       # [B,D]
-        # w, idx = self.state_gate(pooled)                        # [B,k]]
-        # mixed = self.state_experts(latent, w, idx)
-        # latent = latent + mixed
+        # (2) MoE with top-k experts (sequence-level)
+        pooled = self.state_ln_moe_in(latent.mean(dim=1))       # [B,D]
+        w, idx_experts = self.state_gate(pooled)                # [B,k]
+        mixed = self.state_experts(latent, w, idx_experts)
+        latent = latent + mixed
 
         # (3) Choose *one* target slot per sample and update state only there
         logits = self.state_slot_ctx(self.state_ln_slot(latent)).squeeze(-1)        # [B,S]
@@ -165,18 +165,46 @@ class RecurrentMoE(nn.Module):
         latent_out = latent_out + self.out_ffn(self.out_ln_ffn(latent_out))
         y = self.out_proj(latent_out[:, -1])
 
-        info = {"idx_experts": 0, "idx_slots": tgt_idx.detach()} # idx
+        info = {"idx_experts": idx_experts.detach(), "idx_slots": tgt_idx.detach()}
         return y, info, state.reshape([B, S*D]).contiguous()
     
-def get_expert_latent_activated(info):
+def get_expert_latent_activated(model, info):
+    """
+    Extract active parameters and write indices based on MoE routing.
+    
+    Args:
+        model: RecurrentMoE model
+        info: dict with 'idx_slots' (latent slots) and 'idx_experts' (expert indices)
+    
+    Returns:
+        active_params: dict of parameters that were active this step
+        write_indices: list of state indices that were written to
+    """
+    D = model.d
+    state_params = {k: v for k, v in model.named_parameters() if k.startswith("state_")}
+    
+    # Extract activated slot indices
     idx_slots = list(set(info['idx_slots'].flatten().tolist()))
-    proj = sum((list(range(D*i, D*(i+1))) for i in idx_slots), start=[])
-    expert_ids = list(set(info['idx_experts'].flatten().tolist()))
-    ids_pattern = "|".join(map(str, expert_ids))
-    pattern = re.compile(rf'^state_experts\.(W|b)\.({ids_pattern})$')
-    active_experts_params = {name:p for name, p in state_params.items() if pattern.match(name)}
-    active_params = core_params | active_experts_params
-    return active_params, proj
+    write_indices = sum((list(range(D*i, D*(i+1))) for i in idx_slots), start=[])
+    
+    # Extract activated expert indices
+    expert_ids = info.get('idx_experts', [])
+    if not isinstance(expert_ids, list):
+        expert_ids = list(set(expert_ids.flatten().tolist()))
+    
+    # Build pattern for expert parameters
+    pattern = re.compile(r'^state_experts\.(W|b)\.\d+$')
+    core_params = {name: p for name, p in state_params.items() if pattern.match(name) is None}
+    
+    if expert_ids:
+        ids_pattern = "|".join(map(str, expert_ids))
+        expert_pattern = re.compile(rf'^state_experts\.(W|b)\.({ids_pattern})$')
+        active_experts_params = {name: p for name, p in state_params.items() if expert_pattern.match(name)}
+        active_params = {**core_params, **active_experts_params}
+    else:
+        active_params = core_params
+    
+    return active_params, write_indices
 
 # ---------- Tiny usage ----------
 if __name__ == "__main__": 

@@ -1,4 +1,10 @@
 # Block RTRL
+import torch
+import time
+from torch.func import jacrev, vmap, functional_call
+from einops import rearrange
+from structure import CircularTree, sparse_left_mul
+
 # per-point function to batch jacobian later
 def make_f_single(model, write=slice(None)):
     def f(params, h, x, kw):
@@ -30,6 +36,9 @@ class BlockRTRL:
 
     def reset(self):
         [P_t.zero_() for P_t in self.P_t.values()]
+        self.t = 0
+        for k in self.last_update.keys():
+            self.last_update[k] = 0
 
     @torch.no_grad()
     def get_left_product(self, k, l):
@@ -66,33 +75,46 @@ class BlockRTRL:
             Jh_proj = Jh_proj.detach()
             Jtheta_proj = {k: v.detach() for k, v in Jtheta_proj.items()}
 
-        # Update circular buffer
+        # Update circular buffer with sparse Jacobian
         if print_time: t1 = time.time(); print("2: ", t1-t0); t0=t1
-        # self.buffer.update((proj, Jh_proj))
+        self.buffer.update((write, Jh_proj))  # Store (indices, sparse_rows)
         if print_time: t1 = time.time(); print("3: ", t1-t0); t0=t1
-        # self.buffer.append(Jh); if len(self.buffer) > self.len_buffer: self.buffer.pop(0)
 
         # RTRL recursion on active or expiring sensitivities
         for k in self.state_params.keys():
             # Active parameters update
             if k in active_params.keys():
-                # Jtheta = torch.zeros([B, H, self.state_params[k].numel()]); Jtheta[:, proj] = Jtheta_tree[k]
-                # t <-> index [q-1]; product for time s < t starts at s+1, ie index [s - t + (q-1) + 1] = [s - t + q]
-                # idx, L_Jh = self.get_left_product(self.last_update[k] - self.t + self.len_buffer, self.len_buffer)
-                # self.P_t[k][:, idx] = L_Jh @ self.P_t[k]
+                # Use segment tree for lazy update if parameter was inactive for a while
+                if self.t - self.last_update[k] > 1:
+                    # Lazy update: apply product of Jacobians from last_update to now
+                    start_idx = self.last_update[k] - self.t + self.len_buffer
+                    end_idx = self.len_buffer - 1  # up to previous step
+                    if start_idx >= 0 and end_idx > start_idx:
+                        sparse_product = self.get_left_product(start_idx, end_idx)
+                        if sparse_product is not None:
+                            idx, L_Jh = sparse_product
+                            # Apply lazy update: P[idx] = L_Jh @ P
+                            self.P_t[k][:, idx] = L_Jh @ self.P_t[k]
+                
+                # Current step update
                 self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
                 self.P_t[k][:, write] += Jtheta_proj[k]
                 self.last_update[k] = self.t
-            # Expiring parameters update
+            # Expiring parameters update (not active but need propagation)
             else:
                 self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
-        # if print_time: t1 = time.time(); print("4.1: ", t1-t0); t0=t1
-        # for k in self.state_params.keys():
-        #     idx, L_Jh = self.get_left_product(0, self.len_buffer)
-        #     if k not in active_params.keys() and self.last_update[k] <= self.t - self.len_buffer: # == in practice
-        #         self.P_t[k][:, idx] = L_Jh @ self.P_t[k]
-        #         self.last_update[k] = self.t
-        # if print_time: t1 = time.time(); print("4.2: ", t1-t0); t0=t1
+        
+        # Handle parameters that haven't been updated in a long time
+        if print_time: t1 = time.time(); print("4.1: ", t1-t0); t0=t1
+        for k in self.state_params.keys():
+            if k not in active_params.keys() and self.t - self.last_update[k] >= self.len_buffer:
+                # Parameter is expiring from buffer - apply full lazy update
+                sparse_product = self.get_left_product(0, self.len_buffer)
+                if sparse_product is not None:
+                    idx, L_Jh = sparse_product
+                    self.P_t[k][:, idx] = L_Jh @ self.P_t[k]
+                    self.last_update[k] = self.t
+        if print_time: t1 = time.time(); print("4.2: ", t1-t0); t0=t1
 
 
         # Backpropagate, Maintain last activated
