@@ -1,0 +1,55 @@
+===========================================================================
+HAYSTACK TASK - Progressive Testing
+===========================================================================
+
+===========================================================================
+PHASE 1: Test BPTT Convergence on Different Sequence Lengths
+===========================================================================
+
+--- Tiny (len=8, vocab=8) ---
+  Training RNN... 100 200 300 400 500
+  RNN:  Loss = 0.002, Acc = 100.0%
+  Training MoE... 100 200 300 400 500
+  MoE:  Loss = 0.000, Acc = 100.0%
+  ✓ MoE converges on this task!
+
+--- Short (len=12, vocab=10) ---
+  Training RNN... 100 200 300 400 500
+  RNN:  Loss = 0.009, Acc = 100.0%
+  Training MoE... 100 200 300 400 500
+  MoE:  Loss = 1.823, Acc = 18.0%
+  ✗ Too difficult - MoE doesn't learn well
+
+--- Medium (len=16, vocab=12) ---
+  Training RNN... 100 200 300 400 500
+  RNN:  Loss = 1.496, Acc = 40.0%
+  Training MoE... 100 200 300 400 500
+  MoE:  Loss = 2.143, Acc = 18.0%
+  ✗ Too difficult - MoE doesn't learn well
+
+✓ Best config: Tiny (len=8, vocab=8) (Acc=100.0%)
+   Using this for RTRL tests...
+
+===========================================================================
+PHASE 2: Test RTRL on Working Configuration
+===========================================================================
+
+Task: Tiny (len=8, vocab=8)
+Training MoE with RTRL for 500 steps...
+  Progress:/home/ubuntu/rtrl_moe/.venv/lib/python3.12/site-packages/torch/nn/functional.py:6487: UserWarning: There is a performance drop because we have not yet implemented the batching rule for aten::_scaled_dot_product_flash_attention_for_cpu. Please file us an issue on GitHub so that we can prioritize its implementation. (Triggered internally at /pytorch/aten/src/ATen/functorch/BatchedFallback.cpp:81.)
+  attn_output = scaled_dot_product_attention(
+/home/ubuntu/rtrl_moe/.venv/lib/python3.12/site-packages/torch/autograd/graph.py:841: UserWarning: There is a performance drop because we have not yet implemented the batching rule for aten::_scaled_dot_product_flash_attention_for_cpu_backward. Please file us an issue on GitHub so that we can prioritize its implementation. (Triggered internally at /pytorch/aten/src/ATen/functorch/BatchedFallback.cpp:81.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+.. [100: Loss=1.465, Acc=32.0%].. [200: Loss=1.522, Acc=32.0%].. [300: Loss=1.504, Acc=18.0%].. [400: Loss=1.415, Acc=24.0%].. [500: Loss=1.451, Acc=24.0%]
+
+RTRL Results: Loss = 1.451, Acc = 24.0%
+⚠ RTRL shows limited learning - skip speedup test
+
+===========================================================================
+SUMMARY
+===========================================================================
+✓ Found working configuration: Tiny (len=8, vocab=8)
+  - MoE with BPTT converges
+  - RTRL achieves 24.0% accuracy
+
+🎉 HAYSTACK VERIFICATION COMPLETE

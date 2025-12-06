@@ -1,0 +1,84 @@
+/home/ubuntu/rtrl_moe/.venv/lib/python3.12/site-packages/torch/autograd/graph.py:841: UserWarning: There is a performance drop because we have not yet implemented the batching rule for aten::_scaled_dot_product_efficient_attention_backward. Please file us an issue on GitHub so that we can prioritize its implementation. (Triggered internally at /pytorch/aten/src/ATen/functorch/BatchedFallback.cpp:81.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+======================================================================
+THESIS VERIFICATION - Quick Tests
+======================================================================
+
+======================================================================
+TEST 1: Sparse Read/Write Achieves Convergence
+======================================================================
+
+Note: This test verifies that the sparse MoE can train
+      (gradients flow despite gating). Comparing to dense baseline.
+Training sparse MoE with BPTT for 2500 steps...
+  Step  250: Loss = 0.6834, Acc = 82.0%
+  Step  500: Loss = 0.2528, Acc = 96.0%
+  Step  750: Loss = 0.0001, Acc = 100.0%
+  Step 1000: Loss = 0.0001, Acc = 100.0%
+  Step 1250: Loss = 0.0000, Acc = 100.0%
+  Step 1500: Loss = 0.0001, Acc = 100.0%
+  Step 1750: Loss = 0.0000, Acc = 100.0%
+  Step 2000: Loss = 0.0000, Acc = 100.0%
+  Step 2250: Loss = 0.0000, Acc = 100.0%
+  Step 2500: Loss = 0.0000, Acc = 100.0%
+
+Results (Sparse MoE with read/write gating):
+  Initial loss: 0.9373,  accuracy: 66.0%
+  Final loss:   0.0000,  accuracy: 100.0%
+  Loss improvement:  100.0%
+  Accuracy gain:     +34.0%
+
+--- Baseline: Dense RNN (no sparsity, similar param count) ---
+Training dense baseline for 2500 steps...
+  Step  250: Loss = 0.2794, Acc = 87.0%
+  Step  500: Loss = 0.1626, Acc = 96.0%
+  Step  750: Loss = 0.0135, Acc = 100.0%
+  Step 1000: Loss = 0.0040, Acc = 100.0%
+  Step 1250: Loss = 0.0019, Acc = 100.0%
+  Step 1500: Loss = 0.0016, Acc = 100.0%
+  Step 1750: Loss = 0.0009, Acc = 100.0%
+  Step 2000: Loss = 0.0007, Acc = 100.0%
+  Step 2250: Loss = 0.0005, Acc = 100.0%
+  Step 2500: Loss = 0.0004, Acc = 100.0%
+
+Results (Dense RNN baseline):
+  Initial loss: 0.5669,  accuracy: 80.0%
+  Final loss:   0.0004,  accuracy: 100.0%
+  Loss improvement:  99.9%
+  Accuracy gain:     +20.0%
+
+Comparison:
+  Sparse MoE final accuracy: 100.0%
+  Dense RNN final accuracy:  100.0%
+✓✓ VERIFIED: Sparse MoE reaches zero loss (perfect convergence)!
+
+======================================================================
+TEST 2: Segment Tree Lazy Update Performance
+======================================================================
+Running 50 steps with SPARSE updates (segment tree enabled)...
+Running 50 steps with FULL updates (no sparsity)...
+
+Results:
+  Sparse (w/ segment tree): 4.985s
+  Full (no sparsity):       13.539s
+  Speedup:                  2.72x
+✓ VERIFIED: Sparse RTRL with lazy segment tree is faster!
+
+======================================================================
+THESIS VERIFICATION SUMMARY
+======================================================================
+
+1. Sparse read/write works (convergence despite gating)
+   ✓ VERIFIED
+   Loss improved by 100.0%, accuracy: 66.0% → 100.0%
+
+2. Segment tree lazy updates faster than full updates
+   ✓ VERIFIED
+   Sparse updates 2.72x faster than full updates
+
+🎉 THESIS COMPLETELY VERIFIED!
+   ✓ Sparse read/write enables convergence
+   ✓ Segment tree lazy updates provide speedup
+======================================================================
+
