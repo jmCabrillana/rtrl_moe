@@ -1,5 +1,8 @@
 # Block RTRL
 # per-point function to batch jacobian later
+from einops import rearrange
+from circular_seg_tree import CircularTree, sparse_left_mul
+
 def make_f_single(model, write=slice(None)):
     def f(params, h, x, kw):
         x1, h1 = rearrange(x, '... -> 1 ...'), rearrange(h, '... -> 1 ...')
