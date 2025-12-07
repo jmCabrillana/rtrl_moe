@@ -100,20 +100,18 @@ class BlockRTRL:
                 self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
                 self.P_t[k][:, write] += Jtheta_proj[k]
                 self.last_update[k] = self.t
-            # Expiring parameters update (not active but need propagation)
-            else:
-                self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
-        
-        # Handle parameters that haven't been updated in a long time
-        if print_time: t1 = time.time(); print("4.1: ", t1-t0); t0=t1
-        for k in self.state_params.keys():
-            if k not in active_params.keys() and self.t - self.last_update[k] >= self.len_buffer:
-                # Parameter is expiring from buffer - apply full lazy update
+            
+            # Expiring parameters: haven't been updated for >= len_buffer steps
+            elif self.t - self.last_update[k] >= self.len_buffer:
+                # Apply full lazy update from entire buffer before it expires
                 sparse_product = self.get_left_product(0, self.len_buffer)
                 if sparse_product is not None:
                     idx, L_Jh = sparse_product
                     self.P_t[k][:, idx] = L_Jh @ self.P_t[k]
-                    self.last_update[k] = self.t
+                self.last_update[k] = self.t
+            
+            # Inactive parameters (not active, not expiring yet): skip this step
+            # They will be lazily updated when they become active or when expiring
         if print_time: t1 = time.time(); print("4.2: ", t1-t0); t0=t1
 
 

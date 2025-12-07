@@ -96,7 +96,10 @@ class RecurrentMoE(nn.Module):
         self.state_ln_moe_in = nn.LayerNorm(d)
         self.state_latent_proj = nn.Linear(d, d)
 
-        # Latent projection
+        # Read gate: select which slots to READ from
+        self.state_read_gate = nn.Linear(d, 1, bias=False)
+        
+        # Write gate: select which slots to WRITE to
         self.state_ln_slot = nn.LayerNorm(d)
         self.state_slot_ctx = nn.Linear(d, 1, bias=False)
 
@@ -128,6 +131,10 @@ class RecurrentMoE(nn.Module):
         pe = fourier_pos_enc(pos, D, base=S)
         # self.t += T
 
+        # (0) Read gating: select which slots to READ from
+        read_scores = self.state_read_gate(latent).squeeze(-1)  # [B, S]
+        _, read_idx = torch.topk(read_scores, 2, dim=-1)  # [B, 2] - select top-2 slots to read
+        
         # (1) Mixed attention
         latent_state_x = self.state_embedding(x) + pe
         q = self.state_ln_q(latent)
@@ -165,12 +172,16 @@ class RecurrentMoE(nn.Module):
         latent_out = latent_out + self.out_ffn(self.out_ln_ffn(latent_out))
         y = self.out_proj(latent_out[:, -1])
 
-        info = {"idx_experts": idx_experts.detach(), "idx_slots": tgt_idx.detach()}
+        info = {
+            "idx_experts": idx_experts.detach(), 
+            "idx_slots": tgt_idx.detach(),  # write slots
+            "idx_slots_read": read_idx.detach()  # read slots
+        }
         return y, info, state.reshape([B, S*D]).contiguous()
     
 def get_expert_latent_activated(model, info):
     """
-    Extract active parameters and write indices based on MoE routing.
+    Extract active parameters and read/write indices based on MoE routing.
     
     Args:
         model: RecurrentMoE model
@@ -179,13 +190,24 @@ def get_expert_latent_activated(model, info):
     Returns:
         active_params: dict of parameters that were active this step
         write_indices: list of state indices that were written to
+        read_indices: list of state indices that were read from (for Jacobian computation)
     """
     D = model.d
+    S = model.n_slots
     state_params = {k: v for k, v in model.named_parameters() if k.startswith("state_")}
     
-    # Extract activated slot indices
-    idx_slots = list(set(info['idx_slots'].flatten().tolist()))
-    write_indices = sum((list(range(D*i, D*(i+1))) for i in idx_slots), start=[])
+    # Extract activated slot indices for WRITE (these are updated)
+    idx_slots_write = list(set(info['idx_slots'].flatten().tolist()))
+    write_indices = sum((list(range(D*i, D*(i+1))) for i in idx_slots_write), start=[])
+    
+    # Extract activated slot indices for READ (from read gating)
+    if 'idx_slots_read' in info:
+        idx_slots_read = list(set(info['idx_slots_read'].flatten().tolist()))
+    else:
+        # Fallback: read from write slots if read gating not available
+        idx_slots_read = idx_slots_write
+    
+    read_indices = sum((list(range(D*i, D*(i+1))) for i in idx_slots_read), start=[])
     
     # Extract activated expert indices
     expert_ids = info.get('idx_experts', [])
@@ -204,7 +226,7 @@ def get_expert_latent_activated(model, info):
     else:
         active_params = core_params
     
-    return active_params, write_indices
+    return active_params, write_indices, read_indices
 
 # ---------- Tiny usage ----------
 if __name__ == "__main__": 

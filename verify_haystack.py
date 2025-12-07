@@ -264,71 +264,71 @@ else:
     print("(Testing speedup regardless of RTRL accuracy)")
     
     model_perf = RecurrentMoE(
-            d_model=32,
-            n_heads=2,
-            n_slots=4,
-            n_experts=8,
-            topk=2,
-            d_in=VOCAB_SIZE,
-            d_out=OUTPUT_DIM
-        ).to(device)
+        d_model=32,
+        n_heads=2,
+        n_slots=4,
+        n_experts=8,
+        topk=2,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    
+    state_params_perf = {k: v for k, v in model_perf.named_parameters() if k.startswith("state_")}
+    B_perf, H_perf = 1, model_perf.d * model_perf.n_slots
+    
+    # Sparse with lazy updates
+    print("Running 15 steps with SPARSE + LAZY (segment tree)...")
+    rtrl_sparse = BlockRTRL(state_params_perf, B_perf, H_perf, len_buffer=24)
+    
+    start = time.time()
+    for step in range(15):
+        x, y = sample_haystack(SEQ_LEN, VOCAB_SIZE, device)
+        h_t = model_perf.init_state(1, device=device).requires_grad_()
+        rtrl_sparse.reset()
         
-        state_params_perf = {k: v for k, v in model_perf.named_parameters() if k.startswith("state_")}
-        B_perf, H_perf = 1, model_perf.d * model_perf.n_slots
+        x_onehot = F.one_hot(x, num_classes=VOCAB_SIZE).float()
         
-        # Sparse with lazy updates
-        print("Running 15 steps with SPARSE + LAZY (segment tree)...")
-        rtrl_sparse = BlockRTRL(state_params_perf, B_perf, H_perf, len_buffer=24)
-        
-        start = time.time()
-        for step in range(15):
-            x, y = sample_haystack(SEQ_LEN, VOCAB_SIZE, device)
-            h_t = model_perf.init_state(1, device=device).requires_grad_()
-            rtrl_sparse.reset()
+        for t in range(SEQ_LEN):
+            x_t = x_onehot[:, t:t+1, :]
+            pred_logits, info, h_next = model_perf(x_t, h_t)
             
-            x_onehot = F.one_hot(x, num_classes=VOCAB_SIZE).float()
+            active_params, write_idx = get_expert_latent_activated(model_perf, info)
+            rtrl_sparse.step(model_perf, x_t, h_t, None, active_params, None, write_idx)
+            h_t = h_next.detach().requires_grad_()
+    
+    sparse_time = time.time() - start
+    
+    # Full updates (no lazy)
+    print("Running 15 steps with SPARSE (NO lazy updates)...")
+    rtrl_full = BlockRTRL(state_params_perf, B_perf, H_perf, len_buffer=24)
+    
+    start = time.time()
+    for step in range(15):
+        x, y = sample_haystack(SEQ_LEN, VOCAB_SIZE, device)
+        h_t = model_perf.init_state(1, device=device).requires_grad_()
+        rtrl_full.reset()
+        
+        x_onehot = F.one_hot(x, num_classes=VOCAB_SIZE).float()
+        
+        for t in range(SEQ_LEN):
+            x_t = x_onehot[:, t:t+1, :]
+            pred_logits, info, h_next = model_perf(x_t, h_t)
             
-            for t in range(SEQ_LEN):
-                x_t = x_onehot[:, t:t+1, :]
-                pred_logits, info, h_next = model_perf(x_t, h_t)
-                
-                active_params, write_idx = get_expert_latent_activated(model_perf, info)
-                rtrl_sparse.step(model_perf, x_t, h_t, None, active_params, None, write_idx)
-                h_t = h_next.detach().requires_grad_()
-        
-        sparse_time = time.time() - start
-        
-        # Full updates (no lazy)
-        print("Running 15 steps with SPARSE (NO lazy updates)...")
-        rtrl_full = BlockRTRL(state_params_perf, B_perf, H_perf, len_buffer=24)
-        
-        start = time.time()
-        for step in range(15):
-            x, y = sample_haystack(SEQ_LEN, VOCAB_SIZE, device)
-            h_t = model_perf.init_state(1, device=device).requires_grad_()
-            rtrl_full.reset()
-            
-            x_onehot = F.one_hot(x, num_classes=VOCAB_SIZE).float()
-            
-            for t in range(SEQ_LEN):
-                x_t = x_onehot[:, t:t+1, :]
-                pred_logits, info, h_next = model_perf(x_t, h_t)
-                
-                # All params, no lazy
-                rtrl_full.step(model_perf, x_t, h_t, None, state_params_perf, None, None)
-                h_t = h_next.detach().requires_grad_()
-        
-        full_time = time.time() - start
-        
-        print(f"\nResults:")
-        print(f"  Sparse + Lazy:  {sparse_time:.2f}s")
-        print(f"  Full updates:   {full_time:.2f}s")
-        print(f"  Speedup:        {full_time / sparse_time:.2f}x")
-        
-        if sparse_time < full_time:
-            print("✓ Segment tree provides speedup!")
-        else:
-            print("⚠ No speedup (might need longer sequences)")
+            # All params, no lazy
+            rtrl_full.step(model_perf, x_t, h_t, None, state_params_perf, None, None)
+            h_t = h_next.detach().requires_grad_()
+    
+    full_time = time.time() - start
+    
+    print(f"\nResults:")
+    print(f"  Sparse + Lazy:  {sparse_time:.2f}s")
+    print(f"  Full updates:   {full_time:.2f}s")
+    print(f"  Speedup:        {full_time / sparse_time:.2f}x")
+    
+    if sparse_time < full_time:
+        print("✓ Segment tree provides speedup!")
+    else:
+        print("⚠ No speedup (might need longer sequences)")
     
     if final_acc_rtrl > 25:
         print("\n✓ RTRL converges on haystack!")
