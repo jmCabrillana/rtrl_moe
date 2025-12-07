@@ -48,9 +48,9 @@ print("=" * 80)
 print()
 
 VOCAB_SIZE = 8
-SEQ_LEN = 16
+SEQ_LEN = 128  # Long sequence to highlight RTRL's memory advantage
 OUTPUT_DIM = VOCAB_SIZE - BASE
-N_STEPS = 100
+N_STEPS = 120  # Enough steps to stabilize on long horizon without long wall-clock
 
 model = RecurrentMoE(
     d_model=32,
@@ -104,11 +104,11 @@ for step in range(N_STEPS):
     acc = (pred_logits.argmax(dim=1) == y).float().mean().item() * 100
     bptt_accs.append(acc)
     
-    if (step + 1) % 20 == 0:
+    if (step + 1) % 50 == 0:
         print(f"{step+1:3d} | {loss:.3f} | {acc:.1f}%")
 
-avg_bptt_loss = sum(bptt_losses[-20:]) / 20
-avg_bptt_acc = sum(bptt_accs[-20:]) / 20
+avg_bptt_loss = sum(bptt_losses[-50:]) / 50
+avg_bptt_acc = sum(bptt_accs[-50:]) / 50
 
 print(f"\nBPTT Final - Loss: {avg_bptt_loss:.3f}, Acc: {avg_bptt_acc:.1f}%")
 
@@ -131,7 +131,7 @@ model_rtrl = RecurrentMoE(
 state_params = {k: v for k, v in model_rtrl.named_parameters() if k.startswith("state_")}
 B, H = 1, model_rtrl.d * model_rtrl.n_slots
 
-rtrl = BlockRTRL(state_params, B, H, len_buffer=64)
+rtrl = BlockRTRL(state_params, B, H, len_buffer=SEQ_LEN)
 opt_rtrl = torch.optim.Adam(model_rtrl.parameters(), lr=3e-3)
 rtrl_losses = []
 rtrl_accs = []
@@ -174,11 +174,11 @@ for step in range(N_STEPS):
     read_sparse = len(read_idx) / H * 100
     write_sparse = len(write_idx) / H * 100
     
-    if (step + 1) % 20 == 0:
+    if (step + 1) % 50 == 0:
         print(f"{step+1:3d} | {loss:.3f} | {acc:.1f}% | {read_sparse:.0f}% | {write_sparse:.0f}%")
 
-avg_rtrl_loss = sum(rtrl_losses[-20:]) / 20
-avg_rtrl_acc = sum(rtrl_accs[-20:]) / 20
+avg_rtrl_loss = sum(rtrl_losses[-50:]) / 50
+avg_rtrl_acc = sum(rtrl_accs[-50:]) / 50
 
 print(f"\nRTRL Final - Loss: {avg_rtrl_loss:.3f}, Acc: {avg_rtrl_acc:.1f}%")
 

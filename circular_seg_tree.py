@@ -33,6 +33,12 @@ class CircularTree:
         r = (self.head + r) % self.n
         return self._query_phys(l, r) if r > l else self.op(self._query_phys(0, r), self._query_phys(l, self.n))
 
+# Sparse matrix multiplication: sparse LEFT-multiply A @ B
+def sparse_left_mm(a, b):
+    if a is None: return b
+    if b is None: return a
+    return torch.sparse.mm(b, a)
+
 # Binary operation: sparse LEFT-multiply B @ A
 def sparse_left_mul(a, b):
     if a is None: return b
@@ -47,6 +53,7 @@ def sparse_left_mul(a, b):
         Cb = B + B[:, :, idx_a] @ A_delta
         rows = torch.stack([Cb[:, pos_b[i]] if i in pos_b else A[:, pos_a[i]] for i in idx_union], dim=1)
         return (idx_union, rows)
+    
 # def sparse_left_mul(a, b): # 1D
 #     if a is None: return b
 #     elif b is None: return a 
