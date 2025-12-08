@@ -14,7 +14,7 @@ Architecture:
   • 50% read/write sparsity (MoE gating)
   • K-step Lyapunov QR-based stability monitoring
 
-Task: Haystack retrieval on long sequences
+Task: selectable (haystack retrieval or a^n b^n)
 """
 
 import argparse
@@ -23,13 +23,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random
 import time
-import json
 from datetime import datetime
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
-from moe_stable import RecurrentMoE, get_expert_latent_activated, StableRTRLTrainer
-from rtrl_block import BlockRTRL
+# Import model choices
+from rtrl_moe.model.moe import RecurrentMoE, get_expert_latent_activated
+from rtrl_moe.model.rnn import ClassicRNN, get_expert_latent_activated_rnn
+from rtrl_moe.core.rtrl_block import BlockRTRL
+from rtrl_moe.core.stable_trainer import StableRTRLTrainer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}\n")
@@ -53,8 +55,6 @@ D_MODEL = 32
 N_SLOTS = 4
 N_EXPERTS = 4
 TOPK = 2
-VOCAB_SIZE = 8
-OUTPUT_DIM = VOCAB_SIZE - 4
 
 # Stability regularization
 LYAPUNOV_K = 16  # K-step window for Lyapunov penalty
@@ -68,34 +68,23 @@ CKPT_INTERVAL = 100
 SAVE_EVERY = 100
 LOG_INTERVAL = 20
 
-parser = argparse.ArgumentParser(description="Train or resume Stable MoE RTRL")
+parser = argparse.ArgumentParser(description="Train or resume RNN/MoE RTRL")
+parser.add_argument("--model", type=str, default="moe", choices=["moe", "rnn"], help="Select model architecture")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
 parser.add_argument("--extra-steps", type=int, default=N_STEPS, help="Number of additional steps to run (if resuming)")
+parser.add_argument("--task", type=str, default="haystack", choices=["haystack", "anbn"], help="Select training task")
 args = parser.parse_args()
 
-# Haystack task tokens
-BOS, KEY, SEP, Q, BASE = 0, 1, 2, 3, 4
+# ============ Task selection ============
+if args.task == "haystack":
+    from rtrl_moe.tasks import haystack as task
+elif args.task == "anbn":
+    from rtrl_moe.tasks import anbn as task
+else:
+    raise ValueError(f"Unsupported task: {args.task}")
 
-def sample_haystack(seq_len, vocab_size, device):
-    """Generate haystack retrieval task"""
-    x = torch.empty(1, seq_len, dtype=torch.long)
-    y = torch.empty(1, dtype=torch.long)
-    
-    k = random.randrange(vocab_size - BASE)
-    ins = random.randrange(1, max(2, seq_len - 5))
-    
-    seq = [BOS]
-    while len(seq) < ins:
-        seq.append(random.randrange(BASE, vocab_size))
-    seq += [KEY, BASE + k, SEP]
-    while len(seq) < seq_len - 1:
-        seq.append(random.randrange(BASE, vocab_size))
-    seq.append(Q)
-    
-    x[0] = torch.tensor(seq, dtype=torch.long)
-    y[0] = k
-    
-    return x.to(device), y.to(device)
+VOCAB_SIZE = task.VOCAB_SIZE
+OUTPUT_DIM = task.OUTPUT_DIM
 
 # ============ Setup ============
 resume_ckpt = Path(args.checkpoint) if args.checkpoint else None
@@ -120,24 +109,46 @@ print("=" * 80)
 print(f"Experiment: {exp_name}")
 print("=" * 80)
 print(f"Sequence length: {SEQ_LEN:,} tokens")
-print(f"Model: MoE (d={D_MODEL}, slots={N_SLOTS}, experts={N_EXPERTS}, topk={TOPK})")
-print(f"Regularization: Lyapunov={LYAPUNOV_WEIGHT}, Expert norm={EXPERT_NORM_WEIGHT}")
+print(f"Task: {args.task} (vocab={VOCAB_SIZE}, out_dim={OUTPUT_DIM})")
+print(f"Model: {args.model.upper()} (d={D_MODEL}, slots={N_SLOTS}" + 
+      (f", experts={N_EXPERTS}, topk={TOPK})" if args.model == "moe" else ")"))
+if args.model == "moe":
+    print(f"Regularization: Lyapunov={LYAPUNOV_WEIGHT}, Expert norm={EXPERT_NORM_WEIGHT}")
 print(f"Logs: {log_dir}")
 print(f"Checkpoints: {checkpoint_dir}")
 print()
 
 # ============ Model & Training Setup ============
-model = RecurrentMoE(
-    d_model=D_MODEL,
-    n_heads=2,
-    n_slots=N_SLOTS,
-    n_experts=N_EXPERTS,
-    topk=TOPK,
-    d_in=VOCAB_SIZE,
-    d_out=OUTPUT_DIM
-).to(device)
+if args.model == "moe":
+    model = RecurrentMoE(
+        d_model=D_MODEL,
+        n_heads=2,
+        n_slots=N_SLOTS,
+        n_experts=N_EXPERTS,
+        topk=TOPK,
+        topk_read=2,
+        topk_write=2,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    get_active_params = get_expert_latent_activated
+elif args.model == "rnn":
+    model = ClassicRNN(
+        d_model=D_MODEL,
+        n_heads=2,
+        n_slots=N_SLOTS,
+        n_experts=N_EXPERTS,
+        topk=TOPK,
+        topk_read=2,
+        topk_write=2,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    get_active_params = get_expert_latent_activated_rnn
+else:
+    raise ValueError(f"Unsupported model: {args.model}")
 
-state_params = {k: v for k, v in model.named_parameters() if k.startswith("state_")}
+state_params = {k: v for k, v in model.named_parameters() if not k.startswith("output_")}
 H = model.d * model.n_slots
 
 # BlockRTRL buffer for efficient sparse updates
@@ -179,8 +190,7 @@ try:
         t0 = time.time()
         
         # Sample ultra-long sequence
-        x, y = sample_haystack(SEQ_LEN, VOCAB_SIZE, device)
-        x_onehot = F.one_hot(x, num_classes=VOCAB_SIZE).float()
+        x_onehot, y = task.sample(SEQ_LEN, device, batch_size=BATCH_SIZE)
         
         # Initialize state
         h_t = model.init_state(BATCH_SIZE, device=device).requires_grad_()
@@ -193,7 +203,7 @@ try:
             x_t = x_onehot[:, t:t+1, :]
             pred_logits, info, h_next = model(x_t, h_t)
             
-            active_params, write_idx, read_idx = get_expert_latent_activated(model, info)
+            active_params, write_idx, read_idx = get_active_params(model, info)
             rtrl.step(model, x_t, h_t, None, active_params, read_idx, write_idx)
             h_t = h_next.detach().requires_grad_()
             
@@ -209,7 +219,7 @@ try:
         t_bwd_start = time.time()
         x_t = x_onehot[:, -1:, :]
         pred_logits, info, h_next = model(x_t, h_t)
-        active_params, write_idx, read_idx = get_expert_latent_activated(model, info)
+        active_params, write_idx, read_idx = get_active_params(model, info)
         
         task_loss = criterion(pred_logits, y)
         
