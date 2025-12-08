@@ -17,6 +17,7 @@ Architecture:
 Task: Haystack retrieval on long sequences
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,9 +43,9 @@ RUN_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Sequence length: start moderate, scale up if stable
-SEQ_LEN = 256  # Can increase to 512, 1024, etc if system is stable
+SEQ_LEN = 128  # Reduced for faster iterations during testing
 BATCH_SIZE = 1
-N_STEPS = 500
+N_STEPS = 200  # ~30-35 min with seq_len=128
 LR = 3e-3
 
 # Model architecture
@@ -64,7 +65,13 @@ GRAD_CLIP = 1.0
 
 # Training schedule
 CKPT_INTERVAL = 100
+SAVE_EVERY = 100
 LOG_INTERVAL = 20
+
+parser = argparse.ArgumentParser(description="Train or resume Stable MoE RTRL")
+parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+parser.add_argument("--extra-steps", type=int, default=N_STEPS, help="Number of additional steps to run (if resuming)")
+args = parser.parse_args()
 
 # Haystack task tokens
 BOS, KEY, SEP, Q, BASE = 0, 1, 2, 3, 4
@@ -91,10 +98,20 @@ def sample_haystack(seq_len, vocab_size, device):
     return x.to(device), y.to(device)
 
 # ============ Setup ============
-exp_name = f"sparse_moe_rtrl_1m_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-log_dir = Path("runs") / exp_name
+resume_ckpt = Path(args.checkpoint) if args.checkpoint else None
+
+if resume_ckpt:
+    exp_name = resume_ckpt.parent.name
+    log_dir = Path("runs") / exp_name
+    checkpoint_dir = resume_ckpt.parent
+    start_step = 0
+else:
+    exp_name = f"sparse_moe_rtrl_1m_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = Path("runs") / exp_name
+    checkpoint_dir = Path("checkpoints") / exp_name
+    start_step = 0
+
 log_dir.mkdir(parents=True, exist_ok=True)
-checkpoint_dir = Path("checkpoints") / exp_name
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 writer = SummaryWriter(str(log_dir))
@@ -137,6 +154,17 @@ trainer = StableRTRLTrainer(
 
 criterion = nn.CrossEntropyLoss()
 
+if resume_ckpt:
+    print(f"Resuming from checkpoint: {resume_ckpt}")
+    checkpoint = torch.load(resume_ckpt, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    trainer.optimizer.load_state_dict(checkpoint["optimizer_state"])
+    start_step = checkpoint.get("step", 0)
+    print(f"Starting at step {start_step} → running {args.extra_steps} additional steps (target step {start_step + args.extra_steps})")
+else:
+    print(f"Fresh run for {args.extra_steps} steps")
+target_step = start_step + args.extra_steps
+
 # ============ Training Loop ============
 print("Starting training on 1M-token sequences...")
 print()
@@ -147,7 +175,7 @@ read_sparsities = []
 write_sparsities = []
 
 try:
-    for step in range(N_STEPS):
+    for step in range(start_step, target_step):
         t0 = time.time()
         
         # Sample ultra-long sequence
@@ -178,19 +206,26 @@ try:
         t_fwd = time.time() - t_fwd_start
         
         # Final timestep with loss
+        t_bwd_start = time.time()
         x_t = x_onehot[:, -1:, :]
         pred_logits, info, h_next = model(x_t, h_t)
         active_params, write_idx, read_idx = get_expert_latent_activated(model, info)
         
         task_loss = criterion(pred_logits, y)
         
-        # Backward with regularization
-        t_bwd_start = time.time()
-        loss_components = trainer.backward_step(task_loss, state_h=h_t, clip_norm=GRAD_CLIP)
+        # Do RTRL step with loss (this handles backward)
+        rtrl.step(model, x_t, h_t, task_loss, active_params, read_idx, write_idx)
+        
+        # Manual gradient clipping and optimizer step
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        trainer.optimizer.step()
         t_bwd = time.time() - t_bwd_start
         
-        # Do final RTRL step
-        rtrl.step(model, x_t, h_t, task_loss, active_params, read_idx, write_idx)
+        loss_components = {
+            'task_loss': task_loss.item(),
+            'grad_norm': grad_norm.item(),
+            'total_loss': task_loss.item()
+        }
         
         # Logging
         acc = (pred_logits.argmax(dim=1) == y).float().mean().item() * 100
@@ -206,11 +241,12 @@ try:
         
         # Console output
         print(f"Step {step+1:3d} | Loss: {loss_components['task_loss']:.3f} | Acc: {acc:6.1f}% | "
-              f"Read%: {read_sparse:5.1f} | Write%: {write_sparse:5.1f} | "
-              f"Time: {total_time:6.1f}s (fwd: {t_fwd:.1f}s, bwd: {t_bwd:.1f}s)")
+            f"Read%: {read_sparse:5.1f} | Write%: {write_sparse:5.1f} | "
+            f"Time: {total_time:6.1f}s (fwd: {t_fwd:.1f}s, bwd: {t_bwd:.1f}s)")
         
         # TensorBoard logging
         writer.add_scalar('loss/task', loss_components['task_loss'], step)
+        writer.add_scalar('gradients/norm', loss_components['grad_norm'], step)
         if 'lyap_penalty' in loss_components:
             writer.add_scalar('loss/lyapunov', loss_components['lyap_penalty'], step)
         if 'expert_penalty' in loss_components:
@@ -222,6 +258,12 @@ try:
         writer.add_scalar('timing/forward', t_fwd, step)
         writer.add_scalar('timing/backward', t_bwd, step)
         writer.add_scalar('timing/total', total_time, step)
+        
+        # Log gradient norms per parameter group (every 10 steps)
+        if step % 10 == 0:
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    writer.add_scalar(f'gradients/{name}', param.grad.norm().item(), step)
         
         # Checkpointing
         if (step + 1) % SAVE_EVERY == 0:
