@@ -57,8 +57,25 @@ class TopKGate(nn.Module):
         self.proj = nn.Linear(d, n_experts, bias=False)
     def forward(self, h):                         # h: [B,D]
         logits = self.proj(h)                     # [B,E]
+        
+        # Masked softmax: softmax over all experts, then mask to topk
+        weights_full = F.softmax(logits, dim=-1)  # [B,E] - gradients to all experts
+        
+        # Get topk indices
         val, idx = torch.topk(logits, self.k, dim=-1)  # [B,k]
-        return val.softmax(-1), idx               # normalize over top-k
+        
+        # Create mask for topk
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(1, idx, True)  # [B,E] - True for topk experts
+        
+        # Apply mask and renormalize
+        weights_masked = weights_full * mask.float()  # [B,E]
+        weights_masked = weights_masked / (weights_masked.sum(dim=-1, keepdim=True) + 1e-9)
+        
+        # Gather weights for topk experts
+        weights_topk = torch.gather(weights_masked, 1, idx)  # [B,k]
+        
+        return weights_topk, idx
     
 def fourier_pos_enc(pos, d, base=10000): 
     sin = torch.sin(pos / base**(torch.arange(0,d//2).to(pos)/ (d//2))).to(pos)
@@ -105,7 +122,7 @@ class RecurrentMoE(nn.Module):
         
         # Write gate: select which slots to WRITE to
         self.state_ln_slot = nn.LayerNorm(d)
-        self.state_slot_ctx = nn.Linear(d, 1, bias=False)
+        self.state_write_gate = nn.Linear(d, 1, bias=False)
 
         # Output Attention
         self.out_embedding = nn.Linear(d_in, d)
@@ -115,6 +132,9 @@ class RecurrentMoE(nn.Module):
         self.out_ffn = MLP(d, dropout=dropout)
         self.out_ln_ffn = nn.LayerNorm(d)
         self.out_proj = nn.Linear(d, d_out)
+        
+        # STABILITY FIX: Add LayerNorm on state to bound norms
+        self.state_ln = nn.LayerNorm(d)
 
         self.t=0
 
@@ -144,10 +164,23 @@ class RecurrentMoE(nn.Module):
         # self.t += T
 
         # (0) Read gating: select which slots to READ from
-        read_scores = self.state_read_gate(latent).squeeze(-1)  # [B, k]
-        logits, read_idx = torch.topk(read_scores, self.topk_read, dim=-1)  # [B, k] - select top-k slots to read
+        read_scores = self.state_read_gate(latent).squeeze(-1)  # [B, S]
+        _, read_idx = torch.topk(read_scores, self.topk_read, dim=-1)  # [B, k] indices
+        
+        # Masked softmax: compute softmax over all, then zero out non-topk
+        read_weights_full = F.softmax(read_scores, dim=-1)  # [B, S] - gradients flow to all slots
+        # Create mask for topk
+        mask = torch.zeros_like(read_scores, dtype=torch.bool)
+        mask.scatter_(1, read_idx, True)  # [B, S] - True for topk slots
+        read_weights_masked = read_weights_full * mask.float()  # [B, S] - zero out non-topk
+        # Renormalize to sum to 1 over topk slots
+        read_weights_masked = read_weights_masked / (read_weights_masked.sum(dim=-1, keepdim=True) + 1e-9)
+        
+        # Gather weights and slots for topk
+        read_weights = torch.gather(read_weights_masked, 1, read_idx)  # [B, k]
         read_idx_expanded = read_idx.unsqueeze(-1).expand(B, self.topk_read, D)  # [B, k, D]
-        latent_read = torch.gather(latent, 1, read_idx_expanded) * logits.unsqueeze(-1)  # [B, k, D] - selected slots
+        latent_read = torch.gather(latent, 1, read_idx_expanded)  # [B, k, D]
+        latent_read = latent_read * read_weights.unsqueeze(-1)  # Weight by masked softmax scores
         
         # (1) Mixed attention
         latent_state_x = self.state_embedding(x) + pe
@@ -167,17 +200,38 @@ class RecurrentMoE(nn.Module):
             latent_read = self.orthogonalize_slots(latent_read)
 
         # (3) Choose *one* target slot per sample and update state only there
-        logits = self.state_slot_ctx(self.state_ln_slot(latent)).squeeze(-1)        # [B,S]
-        logits, write_idx = torch.topk(logits, self.topk_write, dim=-1)             # [B, k]
+        write_scores = self.state_write_gate(self.state_ln_slot(latent)).squeeze(-1)  # [B,S]
+        _, write_idx = torch.topk(write_scores, self.topk_write, dim=-1)  # [B, k] indices
+        
+        # Masked softmax: compute softmax over all, then zero out non-topk
+        write_weights_full = F.softmax(write_scores, dim=-1)  # [B, S] - gradients flow to all slots
+        # Create mask for topk
+        mask = torch.zeros_like(write_scores, dtype=torch.bool)
+        mask.scatter_(1, write_idx, True)  # [B, S] - True for topk slots
+        write_weights_masked = write_weights_full * mask.float()  # [B, S] - zero out non-topk
+        # Renormalize to sum to 1 over topk slots
+        write_weights_masked = write_weights_masked / (write_weights_masked.sum(dim=-1, keepdim=True) + 1e-9)
+        
+        # Gather weights for topk
+        write_weights = torch.gather(write_weights_masked, 1, write_idx)  # [B, k]
         # Aggregate latent_read into single update vector and weighted write
         latent_update = latent_read.mean(dim=1).unsqueeze(1).expand(B, self.topk_write, D)  # [B, k, D]
-        write_weights = F.softmax(logits, dim=-1)  # [B, k]
-        state_update = torch.zeros(B, S, D, device=device, dtype=dtype)
         write_idx_expanded = write_idx.unsqueeze(-1).expand(B, self.topk_write, D)  # [B, k, D]
         weighted_update = latent_update * write_weights.unsqueeze(-1)  # [B, k, D]
-        state_update = state_update.scatter_add_(1, write_idx_expanded, weighted_update)  # [B, S, D]
-        beta = 0.0
-        state = beta * state_old + (1 - beta) * state_update  # residual update
+        
+        # FIXED: Use non-inplace operations for gradient compatibility
+        # Add weighted update to state
+        state = state_old.clone()
+        state_updated = state.scatter_add(1, write_idx_expanded, weighted_update)  # [B, S, D]
+        
+        # Normalize written slots to bound state norm
+        alpha = 0.5
+        state_flat = state_updated.reshape(B*S, D)
+        state_normalized = self.state_ln(state_flat).reshape(B, S, D)
+        
+        # Blend: only update written slots, keep others from state_old
+        state_blended_written = (1 - alpha) * state_old.gather(1, write_idx_expanded) + alpha * state_normalized.gather(1, write_idx_expanded)
+        state = state_old.scatter(1, write_idx_expanded, state_blended_written)  # [B, S, D]
 
         # (4) Output 
         latent_out = self.out_embedding(x) + pe

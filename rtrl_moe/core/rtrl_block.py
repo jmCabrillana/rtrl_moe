@@ -1,6 +1,5 @@
 # Block RTRL
 import torch
-import time
 from torch.func import jacrev, vmap, functional_call
 from einops import rearrange
 from .circular_seg_tree import CircularTree, sparse_left_mm
@@ -29,7 +28,6 @@ class BlockRTRL:
         self.last_update = {k:0 for k in self.state_params.keys()}
         self.len_buffer = len_buffer
         self.len_buffer_hk = len_buffer_hk
-        # self.buffer = CircularMatTree(len_buffer, torch.eye(H).expand(B, -1, -1).to(list(self.state_params.values())[0]))
         self.buffer = CircularTree(len_buffer, None, sparse_left_mm)
         self.last_hk = [0]
         self.t = 0
@@ -43,32 +41,23 @@ class BlockRTRL:
     @torch.no_grad()
     def get_left_product(self, k, l):
         return self.buffer.query(k, l)
-      #   if l is None: l = len(self.buffer)
-      #   L = torch.eye(H).expand(B, -1, -1)
-      #   for i in range(k, l):
-      #     L = torch.bmm(self.buffer[i], L)
-      #   return L
 
     @torch.no_grad()
     def step(self, model, x_t, h_t, loss, active_params, read=None, write=None, **kw):
         """
         x_t: [B,...], h_t: [B,H], P_t: [B,H,Tp], dL_dH_t: [B,H]
         """
-        t0 = time.time()
         params = dict(model.named_parameters())
         B, H = h_t.shape[:2]
         read = list(range(H)) if read is None else read
         write = list(range(H)) if write is None else write
         f1 = make_f_single(model, write)
 
-        print_time = False
 
         # batched jacobian of per-sample f
         with torch.enable_grad():
-            if print_time: t1 = time.time(); print("0: ", t1-t0); t0=t1
             Jh_proj = vmap(jacrev(f1, argnums=1), in_dims=(None, 0, 0, None))(active_params, h_t, x_t, kw)  # [B,W,H]
             # Jh = torch.eye(H).repeat(B, 1, 1).to(h_t), Jh[:, proj] = Jh_proj
-            if print_time: t1 = time.time(); print("1: ", t1-t0)
             Jtheta_proj = vmap(jacrev(f1, argnums=0), in_dims=(None, 0, 0, None))(active_params, h_t, x_t, kw) # [B,W,[...]]
             Jtheta_proj = {k:rearrange(v, 'b h ... -> b h (...)') for k, v in Jtheta_proj.items()}  # [B,W,[Tp]]
             # >>> Detach before storing <<<
@@ -76,7 +65,6 @@ class BlockRTRL:
             Jtheta_proj = {k: v.detach() for k, v in Jtheta_proj.items()}
 
         # Update circular buffer with sparse Jacobian
-        if print_time: t1 = time.time(); print("2: ", t1-t0); t0=t1
         # Convert dense Jh_proj [B, len(write), len(read)] to sparse format
         # Create sparse COO tensor for each batch
         sparse_jac_list = []
@@ -109,7 +97,6 @@ class BlockRTRL:
         sparse_jac_batch = sparse_jac_list[0] if B == 1 else torch.stack(sparse_jac_list)
         
         self.buffer.update(sparse_jac_batch)
-        if print_time: t1 = time.time(); print("3: ", t1-t0); t0=t1
 
         # RTRL recursion on active or expiring sensitivities
         for k in self.state_params.keys():
@@ -150,13 +137,15 @@ class BlockRTRL:
                     col_idx = indices[1].unique().tolist()
                     
                     # Apply sparse update
-                    sub_sparse = sparse_product.to_dense()[row_idx][:, col_idx]
-                    self.P_t[k][:, row_idx] = sub_sparse @ self.P_t[k][:, col_idx]
+                    # sub_sparse = sparse_product.to_dense()[row_idx][:, col_idx]
+                    # self.P_t[k][:, row_idx] = sub_sparse @ self.P_t[k][:, col_idx]
+                    sub_sparse = sparse_product.to_sparse_csr()[row_idx][:, col_idx] 
+                    result = torch.sparse.mm(sub_sparse, self.P_t[k][col_idx].T)
+                    self.P_t[k][row_idx] = result.T
                 self.last_update[k] = self.t
             
             # Inactive parameters (not active, not expiring yet): skip this step
             # They will be lazily updated when they become active or when expiring
-        if print_time: t1 = time.time(); print("4.2: ", t1-t0); t0=t1
 
 
         # Backpropagate, Maintain last activated
@@ -173,6 +162,5 @@ class BlockRTRL:
             I = set(self.last_hk) & set(write)
             self.last_hk = ([k for k in self.last_hk + write if k not in I] + list(I))
             self.last_hk = self.last_hk[-self.len_buffer_hk:]
-        if print_time: t1 = time.time(); print("5: ", t1-t0); t0=t1
 
         self.t += 1

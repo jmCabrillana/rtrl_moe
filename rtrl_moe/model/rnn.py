@@ -90,30 +90,38 @@ class ClassicRNN(nn.Module):
         device = x.device
         dtype = x.dtype
         
-        # Reshape state to (B, D)
-        h = state_flat.reshape(B, D).contiguous()
+        # Reshape state to (B, S, D)
+        h = state_flat.reshape(B, S, D).contiguous()  # (B, S, D)
+        
+        # Flatten to (B*S, D) for batch processing through RNN
+        h_flat = h.reshape(B * S, D)  # (B*S, D)
         
         # Process sequence timestep by timestep
         for t in range(T):
             x_t = x[:, t, :]  # (B, d_in)
             
-            # Embed input
+            # Embed input and broadcast to all slots
             x_emb = self.input_proj(x_t)  # (B, d)
+            x_emb_expanded = x_emb.unsqueeze(1).expand(B, S, D)  # (B, S, D)
+            x_emb_flat = x_emb_expanded.reshape(B * S, D)  # (B*S, D)
             
             # GRU cell update
-            h = self.rnn_cell(x_emb, h)  # (B, d)
+            h_flat = self.rnn_cell(x_emb_flat, h_flat)  # (B*S, D)
             
             # Process with residual layers
-            h_ln = self.ln_rnn(h)
+            h_ln = self.ln_rnn(h_flat)
             h_ffn = self.ffn(h_ln)
-            h = h + h_ffn
+            h_flat = h_flat + h_ffn
         
-        # Output from final hidden state
-        y = self.output_proj(h)  # (B, d_out)
+        # Reshape back to (B, S, D)
+        h = h_flat.reshape(B, S, D)
+        
+        # Output: pool across slots
+        h_pooled = h.mean(dim=1)  # (B, D)
+        y = self.output_proj(h_pooled)  # (B, d_out)
         
         # Reshape state back to flat representation (B, n_slots * d)
-        # Tile h across slots for consistency with MoE interface
-        new_state = h.unsqueeze(1).expand(B, S, D).reshape(B, S * D).contiguous()
+        new_state = h.reshape(B, S * D).contiguous()
         
         # Empty info dict for compatibility
         info = {

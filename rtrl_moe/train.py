@@ -29,19 +29,17 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
 from model.moe import RecurrentMoE, get_expert_latent_activated
+from model.rnn import ClassicRNN, get_expert_latent_activated_rnn
+from model.simple_rnn import SimpleRNN, get_active_params_simple
 from core.rtrl_block import BlockRTRL
+from core.stable_trainer import StableRTRLTrainer
 from tasks import haystack, anbn
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}\n")
 
 # ============ Configuration ============
-EXPERIMENT_NAME = "stable_moe_long_seq_rtrl"
-TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_DIR = Path(f"runs/{EXPERIMENT_NAME}_{TIMESTAMP}")
-CKPT_DIR = Path(f"checkpoints/{EXPERIMENT_NAME}_{TIMESTAMP}")
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-CKPT_DIR.mkdir(parents=True, exist_ok=True)
+# (These will be overridden by --exp-name if provided)
 
 # Sequence length: start moderate, scale up if stable
 SEQ_LEN = 128  # Reduced for faster iterations during testing
@@ -66,12 +64,58 @@ GRAD_CLIP = 1.0
 CKPT_INTERVAL = 100
 SAVE_EVERY = 100
 LOG_INTERVAL = 20
+EVAL_BATCH_SIZE = 10  # Number of samples for accuracy evaluation
 
-parser = argparse.ArgumentParser(description="Train or resume Stable MoE RTRL")
+parser = argparse.ArgumentParser(description="Train or resume RNN/MoE RTRL")
+parser.add_argument("--model", type=str, default="moe", choices=["moe", "rnn", "simple"], help="Select model architecture")
+parser.add_argument("--exp-name", type=str, default=None, help="Optional experiment name (overrides default timestamped name)")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
 parser.add_argument("--extra-steps", type=int, default=N_STEPS, help="Number of additional steps to run (if resuming)")
 parser.add_argument("--task", type=str, default="haystack", choices=["haystack", "anbn"], help="Task to train on")
+parser.add_argument("--params", type=str, default="", help="Model hyperparameters as key=value pairs (comma-separated). E.g. 'd_model=64,n_experts=8,topk=4'")
 args = parser.parse_args()
+
+# Parse hyperparameters from --params argument
+def parse_params(param_str):
+    """Parse key=value parameters from string."""
+    params = {}
+    if not param_str:
+        return params
+    for pair in param_str.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            key, val = pair.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            # Try to convert to appropriate type
+            try:
+                if val.lower() in ("true", "false"):
+                    params[key] = val.lower() == "true"
+                elif "e-" in val or "e+" in val or "." in val:
+                    params[key] = float(val)
+                else:
+                    params[key] = int(val)
+            except (ValueError, AttributeError):
+                params[key] = val
+    return params
+
+user_params = parse_params(args.params)
+
+# Apply user parameters to config
+D_MODEL = user_params.get("d_model", D_MODEL)
+N_SLOTS = user_params.get("n_slots", N_SLOTS)
+N_EXPERTS = user_params.get("n_experts", N_EXPERTS)
+TOPK = user_params.get("topk", TOPK)
+TOPK_READ = user_params.get("topk_read", TOPK)
+TOPK_WRITE = user_params.get("topk_write", TOPK)
+LR = user_params.get("lr", LR)
+LYAPUNOV_WEIGHT = user_params.get("lyapunov_weight", LYAPUNOV_WEIGHT)
+EXPERT_NORM_WEIGHT = user_params.get("expert_norm_weight", EXPERT_NORM_WEIGHT)
+WEIGHT_DECAY = user_params.get("weight_decay", WEIGHT_DECAY)
+GRAD_CLIP = user_params.get("grad_clip", GRAD_CLIP)
+SEQ_LEN = user_params.get("seq_len", SEQ_LEN)
+BATCH_SIZE = user_params.get("batch_size", BATCH_SIZE)
+EVAL_BATCH_SIZE = user_params.get("eval_batch_size", EVAL_BATCH_SIZE)
 
 # Select task module
 if args.task == "haystack":
@@ -84,15 +128,13 @@ else:  # anbn
     OUTPUT_DIM = anbn.OUTPUT_DIM
 
 # ============ Setup ============
-resume_ckpt = Path(args.checkpoint) if args.checkpoint else None
-
 if resume_ckpt:
     exp_name = resume_ckpt.parent.name
     log_dir = Path("runs") / exp_name
     checkpoint_dir = resume_ckpt.parent
     start_step = 0
 else:
-    exp_name = f"sparse_moe_rtrl_1m_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    exp_name = args.exp_name if args.exp_name else f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_dir = Path("runs") / exp_name
     checkpoint_dir = Path("checkpoints") / exp_name
     start_step = 0
@@ -107,34 +149,71 @@ print(f"Experiment: {exp_name}")
 print("=" * 80)
 print(f"Task: {args.task}")
 print(f"Sequence length: {SEQ_LEN:,} tokens")
-print(f"Model: MoE (d={D_MODEL}, slots={N_SLOTS}, experts={N_EXPERTS}, topk={TOPK})")
+model_str = f"{args.model.upper()} (d={D_MODEL}, slots={N_SLOTS}" + (f", experts={N_EXPERTS}, topk={TOPK})" if args.model == "moe" else ")")
+print(f"Model: {model_str}")
 print(f"Vocab size: {VOCAB_SIZE}, Output dim: {OUTPUT_DIM}")
-print(f"Regularization: Lyapunov={LYAPUNOV_WEIGHT}, Expert norm={EXPERT_NORM_WEIGHT}")
+if args.model == "moe":
+    print(f"Regularization: Lyapunov={LYAPUNOV_WEIGHT}, Expert norm={EXPERT_NORM_WEIGHT}")
+if user_params:
+    print(f"Custom params: {user_params}")
 print(f"Logs: {log_dir}")
 print(f"Checkpoints: {checkpoint_dir}")
 print()
 
 # ============ Model & Training Setup ============
-model = RecurrentMoE(
-    d_model=D_MODEL,
-    n_heads=2,
-    n_slots=N_SLOTS,
-    n_experts=N_EXPERTS,
-    topk=TOPK,
-    topk_read=TOPK,
-    topk_write=TOPK,
-    d_in=VOCAB_SIZE,
-    d_out=OUTPUT_DIM
-).to(device)
+if args.model == "moe":
+    model = RecurrentMoE(
+        d_model=D_MODEL,
+        n_heads=2,
+        n_slots=N_SLOTS,
+        n_experts=N_EXPERTS,
+        topk=TOPK,
+        topk_read=TOPK_READ,
+        topk_write=TOPK_WRITE,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    get_active_params = get_expert_latent_activated
+    H = D_MODEL * N_SLOTS
+elif args.model == "rnn":
+    model = ClassicRNN(
+        d_model=D_MODEL,
+        n_heads=2,
+        n_slots=N_SLOTS,
+        n_experts=N_EXPERTS,
+        topk=TOPK,
+        topk_read=TOPK_READ,
+        topk_write=TOPK_WRITE,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    get_active_params = get_expert_latent_activated_rnn
+    H = D_MODEL * N_SLOTS
+elif args.model == "simple":
+    model = SimpleRNN(
+        d_model=D_MODEL,
+        d_in=VOCAB_SIZE,
+        d_out=OUTPUT_DIM
+    ).to(device)
+    get_active_params = get_active_params_simple
+    H = D_MODEL
+else:
+    raise ValueError(f"Unsupported model: {args.model}")
 
-state_params = {k: v for k, v in model.named_parameters() if k.startswith("state_")}
-H = model.d * model.n_slots
+state_params = {k: v for k, v in model.named_parameters() if not k.startswith("output_")}
 
 # BlockRTRL buffer for efficient sparse updates
 rtrl = BlockRTRL(state_params, BATCH_SIZE, H, len_buffer=min(SEQ_LEN, 8192))
 
-# Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+# Trainer with regularization
+trainer = StableRTRLTrainer(
+    model,
+    lr=LR,
+    lyapunov_weight=LYAPUNOV_WEIGHT if args.model == "moe" else 0,
+    expert_norm_weight=EXPERT_NORM_WEIGHT if args.model == "moe" else 0,
+    weight_decay=WEIGHT_DECAY
+)
+optimizer = trainer.optimizer
 
 criterion = nn.CrossEntropyLoss()
 
@@ -176,7 +255,7 @@ try:
             x_t = x_onehot[:, t:t+1, :]
             pred_logits, info, h_next = model(x_t, h_t)
             
-            active_params, write_idx, read_idx = get_expert_latent_activated(model, info)
+            active_params, write_idx, read_idx = get_active_params(model, info)
             rtrl.step(model, x_t, h_t, None, active_params, read_idx, write_idx)
             h_t = h_next.detach().requires_grad_()
             
@@ -192,7 +271,7 @@ try:
         t_bwd_start = time.time()
         x_t = x_onehot[:, -1:, :]
         pred_logits, info, h_next = model(x_t, h_t)
-        active_params, write_idx, read_idx = get_expert_latent_activated(model, info)
+        active_params, write_idx, read_idx = get_active_params(model, info)
         
         task_loss = criterion(pred_logits, y)
         
@@ -211,8 +290,24 @@ try:
             'total_loss': task_loss.item()
         }
         
-        # Logging
-        acc = (pred_logits.argmax(dim=1) == y).float().mean().item() * 100
+        # Evaluate accuracy on multiple samples for better estimation
+        with torch.no_grad():
+            all_preds = []
+            all_targets = []
+            for _ in range(max(1, EVAL_BATCH_SIZE // BATCH_SIZE)):
+                x_eval, y_eval = task_module.sample(SEQ_LEN, device, batch_size=BATCH_SIZE)
+                h_eval = model.init_state(BATCH_SIZE, device=device)
+                for t_eval in range(SEQ_LEN - 1):
+                    x_t_eval = x_eval[:, t_eval:t_eval+1, :]
+                    _, _, h_eval = model(x_t_eval, h_eval)
+                x_t_eval = x_eval[:, -1:, :]
+                pred_logits_eval, _, _ = model(x_t_eval, h_eval)
+                all_preds.append(pred_logits_eval.argmax(dim=1))
+                all_targets.append(y_eval)
+            
+            all_preds = torch.cat(all_preds)
+            all_targets = torch.cat(all_targets)
+            acc = (all_preds == all_targets).float().mean().item() * 100
         read_sparse = len(read_idx) / H * 100
         write_sparse = len(write_idx) / H * 100
         
