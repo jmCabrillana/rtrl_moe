@@ -132,8 +132,7 @@ class RecurrentMoE(nn.Module):
         self.out_ffn = MLP(d, dropout=dropout)
         self.out_ln_ffn = nn.LayerNorm(d)
         self.out_proj = nn.Linear(d, d_out)
-        
-        # STABILITY FIX: Add LayerNorm on state to bound norms
+
         self.state_ln = nn.LayerNorm(d)
 
         self.t=0

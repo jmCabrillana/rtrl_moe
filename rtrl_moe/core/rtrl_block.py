@@ -31,6 +31,7 @@ class BlockRTRL:
         self.buffer = CircularTree(len_buffer, None, sparse_left_mm)
         self.last_hk = [0]
         self.t = 0
+        self.last_jacobian_norm = 0.0
 
     def reset(self):
         [P_t.zero_() for P_t in self.P_t.values()]
@@ -49,6 +50,8 @@ class BlockRTRL:
         """
         params = dict(model.named_parameters())
         B, H = h_t.shape[:2]
+        if B != 1:
+            raise ValueError(f"BlockRTRL currently assumes batch size 1; got B={B}.")
         read = list(range(H)) if read is None else read
         write = list(range(H)) if write is None else write
         f1 = make_f_single(model, write)
@@ -65,64 +68,51 @@ class BlockRTRL:
             Jtheta_proj = {k: v.detach() for k, v in Jtheta_proj.items()}
 
         # Update circular buffer with sparse Jacobian
-        # Convert dense Jh_proj [B, len(write), len(read)] to sparse format
-        # Create sparse COO tensor for each batch
-        sparse_jac_list = []
-        for b in range(B):
-            # Build sparse COO format: rows from write_idx, cols from read_idx
-            # Jh_proj[b] is [len(write), H], need to extract columns in read indices
-            # Extract the sub-matrix [len(write), len(read)]
-            Jh_sub = Jh_proj[b][:, read]  # [len(write), len(read)]
-            
-            num_write = len(write)
-            num_read = len(read)
-            
-            # Create meshgrid of indices
-            row_indices = torch.tensor(write, dtype=torch.long, device=Jh_proj.device).unsqueeze(1).repeat(1, num_read)
-            col_indices = torch.tensor(read, dtype=torch.long, device=Jh_proj.device).unsqueeze(0).repeat(num_write, 1)
-            
-            # Flatten indices
-            indices = torch.stack([row_indices.flatten(), col_indices.flatten()])
-            
-            # Flatten values
-            values = Jh_sub.flatten()
-            
-            # Create sparse COO tensor [H, H]
-            sparse_jac = torch.sparse_coo_tensor(
-                indices, values, (H, H), device=Jh_proj.device
-            ).coalesce()
-            sparse_jac_list.append(sparse_jac)
-        
-        # Stack sparse tensors for batch (or just use first if B=1)
-        sparse_jac_batch = sparse_jac_list[0] if B == 1 else torch.stack(sparse_jac_list)
-        
+        Jh_sub = Jh_proj[0][:, read]
+        write_tensor = torch.tensor(write, device=Jh_proj.device, dtype=torch.long)
+        read_tensor = torch.tensor(read, device=Jh_proj.device, dtype=torch.long)
+        indices = torch.cartesian_prod(write_tensor, read_tensor).T
+        values = Jh_sub.flatten()
+
+        # Inject identity rows for hidden coordinates that were not written this step
+        # so their sensitivities keep behaving like h_{t+1,i} = h_{t,i}
+        if len(write) < H:
+            inactive = torch.tensor(sorted(set(range(H)) - set(write)), device=Jh_proj.device, dtype=torch.long)
+            if inactive.numel() > 0:
+                diag_idx = torch.stack([inactive, inactive], dim=0)
+                diag_vals = torch.ones(inactive.numel(), device=Jh_proj.device, dtype=values.dtype)
+                indices = torch.cat([indices, diag_idx], dim=1)
+                values = torch.cat([values, diag_vals], dim=0)
+
+        sparse_jac_batch = torch.sparse_coo_tensor(indices, values, (H, H), device=Jh_proj.device).coalesce()
         self.buffer.update(sparse_jac_batch)
+
+        # Track Frobenius norm (via sparse values) for logging diagnostics
+        jac_values = sparse_jac_batch.values()
+        self.last_jacobian_norm = torch.linalg.vector_norm(jac_values).item() if jac_values.numel() else 0.0
+
 
         # RTRL recursion on active or expiring sensitivities
         for k in self.state_params.keys():
             # Active parameters update
             if k in active_params.keys():
-                # Use segment tree for lazy update if parameter was inactive for a while
-                if self.t - self.last_update[k] > 1:
-                    # Lazy update: apply product of Jacobians from last_update to now
-                    start_idx = self.last_update[k] - self.t + self.len_buffer
-                    end_idx = self.len_buffer - 1  # up to previous step
-                    if start_idx >= 0 and end_idx > start_idx:
-                        sparse_product = self.get_left_product(start_idx, end_idx)
-                        if sparse_product is not None:
-                            # sparse_product is a sparse torch tensor [H, H]
-                            # Extract non-zero rows and columns
-                            indices = sparse_product.coalesce().indices()
-                            row_idx = indices[0].unique().tolist()
-                            col_idx = indices[1].unique().tolist()
-                            
-                            # Apply sparse update: P[row_idx, :] = sparse_product[row_idx, col_idx] @ P[col_idx, :]
-                            # Convert to dense for the relevant submatrix
-                            sub_sparse = sparse_product.to_dense()[row_idx][:, col_idx]
-                            self.P_t[k][:, row_idx] = sub_sparse @ self.P_t[k][:, col_idx]
+                # Use segment tree [last_update[k], t] for lazy update if parameter was inactive for a while
+                if self.t - self.last_update[k] > 0: # always true unless first step
+                    start_logical = self.len_buffer - self.t - self.last_update[k] - 2  
+                    end_logical = self.len_buffer   # including current step
+                    sparse_product = self.get_left_product(start_logical, end_logical)
+                    sparse_coalesced = sparse_product.coalesce()
+                    rows, cols = sparse_coalesced.indices()
+                    vals = sparse_coalesced.values()
+                    mask = (rows != cols) | (vals != 1)
+                    if mask.any():
+                        rows_unique = rows[mask].unique()
+                        cols_unique = cols[mask].unique()
+                        sub_dense = sparse_product.to_dense()[rows_unique][:, cols_unique]
+                        self.P_t[k][:, rows_unique] = sub_dense @ self.P_t[k][:, cols_unique]
                 
                 # Current step update
-                self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
+                # self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read] # moved to segment_tree
                 self.P_t[k][:, write] += Jtheta_proj[k]
                 self.last_update[k] = self.t
             
@@ -130,18 +120,15 @@ class BlockRTRL:
             elif self.t - self.last_update[k] >= self.len_buffer:
                 # Apply full lazy update from entire buffer before it expires
                 sparse_product = self.get_left_product(0, self.len_buffer)
-                if sparse_product is not None:
-                    # sparse_product is a sparse torch tensor [H, H]
-                    indices = sparse_product.coalesce().indices()
-                    row_idx = indices[0].unique().tolist()
-                    col_idx = indices[1].unique().tolist()
-                    
-                    # Apply sparse update
-                    # sub_sparse = sparse_product.to_dense()[row_idx][:, col_idx]
-                    # self.P_t[k][:, row_idx] = sub_sparse @ self.P_t[k][:, col_idx]
-                    sub_sparse = sparse_product.to_sparse_csr()[row_idx][:, col_idx] 
-                    result = torch.sparse.mm(sub_sparse, self.P_t[k][col_idx].T)
-                    self.P_t[k][row_idx] = result.T
+                sparse_coalesced = sparse_product.coalesce()
+                rows, cols = sparse_coalesced.indices()
+                vals = sparse_coalesced.values()
+                mask = (rows != cols) | (vals != 1)
+                if mask.any():
+                    rows_unique = rows[mask].unique()
+                    cols_unique = cols[mask].unique()
+                    sub_dense = sparse_product.to_dense()[rows_unique][:, cols_unique]
+                    self.P_t[k][:, rows_unique] = sub_dense @ self.P_t[k][:, cols_unique]
                 self.last_update[k] = self.t
             
             # Inactive parameters (not active, not expiring yet): skip this step

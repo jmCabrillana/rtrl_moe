@@ -16,24 +16,34 @@ def sample(seq_len: int, device: torch.device, batch_size: int = 1) -> Tuple[tor
 
     Sequences are fixed length (seq_len). Target is 1 if counts match, else 0.
     """
-    max_a = max(1, (seq_len - 1) // 2)
+    max_tokens = max(2, seq_len - 1)  # tokens available before the query
     x = torch.full((batch_size, seq_len), PAD, dtype=torch.long)
     y = torch.empty(batch_size, dtype=torch.long)
 
     for b in range(batch_size):
-        n_a = random.randint(1, max_a)
-
         if random.random() < 0.5:
+            # Positive example: choose n_a so that 2 * n_a fits
+            max_a_pos = max_tokens // 2
+            max_a_pos = max(1, max_a_pos)
+            n_a = random.randint(1, max_a_pos)
             n_b = n_a
             y[b] = 1
         else:
-            choices = [k for k in range(1, max_a + 1) if k != n_a]
-            if choices:
-                n_b = random.choice(choices)
+            # Negative example: choose n_a with room for a different n_b
+            n_a = random.randint(1, max_tokens - 1)
+            possible_n_b = [k for k in range(1, max_tokens - n_a + 1) if k != n_a]
+            if possible_n_b:
+                n_b = random.choice(possible_n_b)
             else:
-                n_b = max(1, n_a - 1)
-            y[b] = 0
+                # If no different count fits, fall back to closest different count within budget
+                n_b = max(1, min(max_tokens - n_a, n_a - 1 if n_a > 1 else 1))
+            # If still equal (can happen for very short seq_len), treat as positive to avoid random labels
+            if n_b == n_a:
+                y[b] = 1
+            else:
+                y[b] = 0
 
+        # Build sequence and ensure it fits before the query token
         seq = [A] * n_a + [B] * n_b
         seq = seq[: seq_len - 1]  # leave room for query token
 
