@@ -190,7 +190,8 @@ def log_metrics_rtrl(
     read_sparsity: float,
     write_sparsity: float,
     sensitivity_norm: float,
-    timing: Dict[str, float]
+    timing: Dict[str, float],
+    jacobian_norm: float = 0.0
 ) -> None:
     """
     Log metrics to TensorBoard for RTRL training.
@@ -204,6 +205,7 @@ def log_metrics_rtrl(
         write_sparsity: Write slot sparsity (%)
         sensitivity_norm: Frobenius norm of sensitivity matrix
         timing: Dict with 'forward', 'backward', 'total' times
+        jacobian_norm: Frobenius norm of Jacobian matrix
     """
     writer.add_scalar('loss/task', loss_components['task_loss'], step)
     writer.add_scalar('gradients/norm', loss_components['grad_norm'], step)
@@ -218,6 +220,7 @@ def log_metrics_rtrl(
     writer.add_scalar('metrics/read_sparsity', read_sparsity, step)
     writer.add_scalar('metrics/write_sparsity', write_sparsity, step)
     writer.add_scalar('metrics/sensitivity_norm', sensitivity_norm, step)
+    writer.add_scalar('metrics/jacobian_norm', jacobian_norm, step)
     writer.add_scalar('timing/forward', timing['forward'], step)
     writer.add_scalar('timing/backward', timing['backward'], step)
     writer.add_scalar('timing/total', timing['total'], step)
@@ -404,23 +407,8 @@ def print_final_summary(
     read_sparsities: List[float],
     write_sparsities: List[float],
     log_dir: Path,
-    seq_len: int,
-    h: int,
     checkpoint_dir: Path = None
 ) -> None:
-    """
-    Print final training summary with statistics.
-    
-    Args:
-        losses: List of loss values
-        accuracies: List of accuracy values
-        read_sparsities: List of read sparsity values
-        write_sparsities: List of write sparsity values
-        log_dir: TensorBoard log directory
-        checkpoint_dir: Checkpoint directory
-        seq_len: Sequence length
-        h: Hidden state dimension
-    """
     print("=" * 80)
     print("TRAINING COMPLETE")
     print("=" * 80)
@@ -441,17 +429,6 @@ def print_final_summary(
 
     print(f"Results saved to:    {log_dir}")
     print(f"Checkpoints at:      {checkpoint_dir}")
-    print()
-
-    print("PROOF: RTRL on 1M TOKENS")
-    print("=" * 80)
-    print(f"✓ Memory requirement:     O(H) = O({h}) scalars (constant)")
-    print(f"✓ BPTT would need:        O(T*H) = O({seq_len:,}*{h}) = {seq_len*h:,} scalars")
-    print(f"✓ Memory savings:         {seq_len}x")
-    print()
-    print("On INFINITE sequences (T→∞):")
-    print(f"  BPTT:  Impossible (memory → ∞)")
-    print(f"  RTRL:  Always feasible (memory = constant {h})")
     print()
 
 

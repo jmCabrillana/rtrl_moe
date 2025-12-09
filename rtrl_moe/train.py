@@ -26,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model.moe import RecurrentMoE, get_expert_latent_activated
 from model.simple_rnn import SimpleRNN, get_active_params_simple
-from core.rtrl_block import BlockRTRL
+from core.rtrl import BlockRTRL
 from core.utils import (
     parse_params, evaluate_accuracy, evaluate_accuracy_bptt,
     save_checkpoint, log_metrics_rtrl, log_metrics_bptt, log_gradient_norms,
@@ -45,7 +45,6 @@ LR = 3e-3
 D_MODEL = 32
 N_SLOTS = 4
 N_EXPERTS = 4
-WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0
 SAVE_EVERY = 100
 EVAL_BATCH_SIZE = 10
@@ -68,7 +67,6 @@ D_MODEL = user_params.get("d_model", D_MODEL)
 N_SLOTS = user_params.get("n_slots", N_SLOTS)
 N_EXPERTS = user_params.get("n_experts", N_EXPERTS)
 LR = user_params.get("lr", LR)
-WEIGHT_DECAY = user_params.get("weight_decay", WEIGHT_DECAY)
 GRAD_CLIP = user_params.get("grad_clip", GRAD_CLIP)
 SEQ_LEN = user_params.get("seq_len", SEQ_LEN)
 EVAL_BATCH_SIZE = user_params.get("eval_batch_size", EVAL_BATCH_SIZE)
@@ -80,6 +78,9 @@ if args.method == "bptt":
 else:  # rtrl
     BATCH_SIZE = 1
     ACCUM_STEPS = user_params.get("accum_steps", ACCUM_STEPS)
+    # RTRL-specific: lower default LR if not overridden (optional)
+    if "lr" not in user_params:
+        LR = 1e-3  # More stable than 3e-3 for RTRL
 
 # ============ Task Setup ============
 task_module = haystack if args.task == "haystack" else anbn
@@ -88,7 +89,6 @@ OUTPUT_DIM = task_module.OUTPUT_DIM
 
 # ============ Model Setup ============
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}\n")
 
 model_config = {
     'd_model': D_MODEL, 'n_heads': 2, 'n_slots': N_SLOTS, 'n_experts': N_EXPERTS,
@@ -96,7 +96,7 @@ model_config = {
 }
 
 # Merge user model-specific params
-skip_training_params = {'lr', 'weight_decay', 'grad_clip', 'seq_len', 'batch_size', 'accum_steps', 'eval_batch_size', 'save_every'}
+skip_training_params = {'lr', 'grad_clip', 'seq_len', 'batch_size', 'accum_steps', 'eval_batch_size', 'save_every'}
 for k, v in user_params.items():
     if k not in skip_training_params:
         model_config[k] = v
@@ -116,13 +116,14 @@ else:
 
 # ============ Training Setup ============
 state_params = {k: v for k, v in model.named_parameters() if not k.startswith("output_")}
-rtrl = BlockRTRL(state_params, BATCH_SIZE, H, len_buffer=min(SEQ_LEN, 8192))
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+rtrl = BlockRTRL(state_params, BATCH_SIZE, H)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR) 
 criterion = nn.CrossEntropyLoss()
 
-# Setup experiment directory & logging
+# Setup experiment directory & logging (always under repo_root/runs)
+repo_root = script_dir.parent
 exp_name = args.exp_name or f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-log_dir = script_dir / "runs" / exp_name
+log_dir = repo_root / "runs" / exp_name
 log_dir.mkdir(parents=True, exist_ok=True)
 writer = SummaryWriter(str(log_dir))
 
@@ -186,9 +187,9 @@ try:
             
             t_bwd = time.time() - t_bwd_start
             sensitivity_norm = compute_sensitivity_norm(rtrl)
+            jacobian_norm = rtrl.last_jacobian_norm
             acc = evaluate_accuracy(model, task_module, SEQ_LEN, device, BATCH_SIZE, EVAL_BATCH_SIZE)
-            read_sparse = len(read_idx) / H * 100
-            write_sparse = len(write_idx) / H * 100
+            read_sparse, write_sparse = len(read_idx) / H * 100, len(write_idx) / H * 100
             
             loss_val = task_loss.item()
             grad_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -196,7 +197,7 @@ try:
             
             print_step_rtrl(step+1, loss_val, acc, read_sparse, write_sparse, sensitivity_norm, timing)
             log_metrics_rtrl(writer, step, {'task_loss': loss_val, 'grad_norm': grad_val, 'total_loss': loss_val}, 
-                           acc, read_sparse, write_sparse, sensitivity_norm, timing)
+                           acc, read_sparse, write_sparse, sensitivity_norm, timing, jacobian_norm)
             losses.append(loss_val)
             read_sparsities.append(read_sparse)
             write_sparsities.append(write_sparse)
@@ -233,8 +234,7 @@ try:
             if args.model == "moe":
                 read_idx = info_seq[-1].get('read_idx', [])
                 write_idx = info_seq[-1].get('write_idx', [])
-                read_sparse = len(read_idx) / H * 100 if H > 0 else 0
-                write_sparse = len(write_idx) / H * 100 if H > 0 else 0
+                read_sparse, write_sparse = len(read_idx) / H * 100, len(write_idx) / H * 100 
             else:
                 read_sparse = write_sparse = 0
             
@@ -263,8 +263,6 @@ except KeyboardInterrupt:
     print("\nTraining interrupted by user.")
 
 # ============ Final Summary ============
-print_final_summary(losses, accuracies, read_sparsities, write_sparsities, log_dir, SEQ_LEN, H)
-
+print_final_summary(losses, accuracies, read_sparsities, write_sparsities, log_dir)
 writer.close()
-print("TensorBoard log closed. View results with:")
-print(f"  tensorboard --logdir={log_dir.parent}")
+print(f" Open with: tensorboard --logdir={log_dir.parent}")

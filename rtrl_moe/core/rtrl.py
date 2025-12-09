@@ -23,26 +23,13 @@ def add_grad_(p, g):
 
 class BlockRTRL:
     @torch.no_grad()
-    def __init__(self, state_params, B, H, len_buffer=64, len_buffer_hk=8):
+    def __init__(self, state_params, B, H):
         self.state_params = state_params
         self.P_t = {k:torch.zeros([B, H, p.numel()]).to(p) for k,p in self.state_params.items()}
-        self.last_update = {k:0 for k in self.state_params.keys()}
-        self.len_buffer = len_buffer
-        self.len_buffer_hk = len_buffer_hk
-        self.last_hk = []
-        self.t = 0
-
-    def reset(self):
-        [P_t.zero_() for P_t in self.P_t.values()]
 
     @torch.no_grad()
-    def get_left_product(self, k, l):
-        return self.buffer.query(k, l)
-      #   if l is None: l = len(self.buffer)
-      #   L = torch.eye(H).expand(B, -1, -1)
-      #   for i in range(k, l):
-      #     L = torch.bmm(self.buffer[i], L)
-      #   return L
+    def reset(self):
+        [P_t.zero_() for P_t in self.P_t.values()]
 
     @torch.no_grad()
     def step(self, model, x_t, h_t, loss, active_params, read=None, write=None, **kw):
@@ -55,7 +42,18 @@ class BlockRTRL:
         write = list(range(H)) if write is None else write
         f1 = make_f_single(model, write)
 
-        print_time = False
+        if loss is not None:            
+            # add direct term
+            dL_dTheta = dict(zip(params.keys(), torch.autograd.grad(loss, params.values(), retain_graph=True, allow_unused=True)))
+            for k, g in dL_dTheta.items():
+                # if k not in self.state_params.keys():
+                add_grad_(params[k], g)
+
+            # add RTRL term using *P_t* 
+            (dL_dH_t,) = torch.autograd.grad(loss, h_t, retain_graph=False) 
+            for k, p in self.state_params.items():
+                g_mean = torch.einsum('b h, b h t -> b t', dL_dH_t, self.P_t[k]).mean(0) 
+                add_grad_(params[k], g_mean.view(p.shape))
 
         # batched jacobian of per-sample f
         with torch.enable_grad():
@@ -72,28 +70,10 @@ class BlockRTRL:
 
         # RTRL recursion on active or expiring sensitivities
         for k in self.state_params.keys():
-            # Active parameters update
+            self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
+            # Active parameters update have non-zero J_theta
             if k in active_params.keys():
-                self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
                 self.P_t[k][:, write] += Jtheta_proj[k]
-            # Expiring parameters update
-            else:
-                self.P_t[k][:, write] = Jh_proj[:,:,read] @ self.P_t[k][:, read]
-
-
-        # Backpropagate, Maintain last activated
-        if loss is not None:
-            dL_dTheta = dict(zip(params.keys(), torch.autograd.grad(loss, params.values(), retain_graph=True, allow_unused=True)))
-            (dL_dH_t,) = torch.autograd.grad(loss, h_t, retain_graph=False) 
-            for k, g in dL_dTheta.items():
-                # if k not in self.state_params.keys():
-                add_grad_(params[k], g)
-            for k, p in self.state_params.items():
-                g_mean = torch.einsum('b h, b h t -> b t', dL_dH_t, self.P_t[k]).mean(0) #[self.last_hk]
-                add_grad_(params[k], g_mean.view(p.shape))
-        if len(write) != H:
-            I = set(self.last_hk) & set(write)
-            self.last_hk = ([k for k in self.last_hk + write if k not in I] + list(I))
-            self.last_hk = self.last_hk[-self.len_buffer_hk:]
-
-        self.t += 1
+            
+            # Guard against NaNs
+            self.P_t[k] = torch.nan_to_num(self.P_t[k], nan=0.0, posinf=0.0, neginf=0.0)        

@@ -285,14 +285,15 @@ def get_expert_latent_activated(model, info):
         expert_ids = list(set(expert_ids.flatten().tolist()))
     
     # Build pattern for expert parameters
-    pattern = re.compile(r'^state_experts\.(W|b)\.\d+$')
-    core_params = {name: p for name, p in state_params.items() if pattern.match(name) is None}
+    expert_pattern = re.compile(r'^state_experts\.(W|b)\.\d+$')
+    # Core params: state_* tensors excluding the per-expert weights/biases
+    core_params = {name: p for name, p in state_params.items() if not expert_pattern.match(name)}
     
     if expert_ids:
         ids_pattern = "|".join(map(str, expert_ids))
         expert_pattern = re.compile(rf'^state_experts\.(W|b)\.({ids_pattern})$')
         active_experts_params = {name: p for name, p in state_params.items() if expert_pattern.match(name)}
-        active_params = {**core_params, **active_experts_params}
+        active_params = core_params | active_experts_params
     else:
         active_params = core_params
     

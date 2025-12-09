@@ -56,6 +56,12 @@ class BlockRTRL:
         write = list(range(H)) if write is None else write
         f1 = make_f_single(model, write)
 
+        # Detect NaNs in inputs before any Jacobian work
+        if torch.isnan(h_t).any():
+            print(f"[RTRL] NaN in h_t at step {self.t}")
+        if torch.isnan(x_t).any():
+            print(f"[RTRL] NaN in x_t at step {self.t}")
+
 
         # batched jacobian of per-sample f
         with torch.enable_grad():
@@ -66,6 +72,13 @@ class BlockRTRL:
             # >>> Detach before storing <<<
             Jh_proj = Jh_proj.detach()
             Jtheta_proj = {k: v.detach() for k, v in Jtheta_proj.items()}
+
+        # Quick NaN diagnostics to narrow source of divergence
+        if torch.isnan(Jh_proj).any():
+            print(f"[RTRL] NaN in Jh_proj at step {self.t}")
+        for k, v in Jtheta_proj.items():
+            if torch.isnan(v).any():
+                print(f"[RTRL] NaN in Jtheta_proj[{k}] at step {self.t}")
 
         # Update circular buffer with sparse Jacobian
         Jh_sub = Jh_proj[0][:, read]
